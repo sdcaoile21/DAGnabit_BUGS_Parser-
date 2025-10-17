@@ -1,12 +1,11 @@
 # ------------------------------------------------------------
-# JAGS/BUGS parser with plates (static) + interactive visNetwork
+# BUGS/JAGS -> Nodes & Edges Tables (plates kept only in nodes table)
+# Returns/exports ONLY nodes & edges
+# Demo/CLI result variable is NodesandEdgesTable
 # ------------------------------------------------------------
 suppressWarnings(suppressMessages({
-  library(igraph)
-  library(visNetwork)
-  library(htmlwidgets)
-  library(htmltools)
-  library(jsonlite)
+  library(utils)
+  library(tools)
 }))
 
 # ---------- Helpers ----------
@@ -35,6 +34,7 @@ suppressWarnings(suppressMessages({
 }
 
 .normalize_index <- function(name) gsub("\\[[^\\]]*\\]", "[]", name, perl = TRUE)
+.strip_all_brackets <- function(name) gsub("\\[\\]", "", .normalize_index(name), perl = TRUE)
 
 .tokenize_symbols <- function(expr) {
   m <- gregexpr("\\b[A-Za-z_][A-Za-z0-9_.]*\\b(?:\\[[^\\]]+\\])?", expr, perl = TRUE)
@@ -54,11 +54,11 @@ suppressWarnings(suppressMessages({
   "dbern","dbin","dcat","ddirch","ddexp","dgamma","dlnorm","dlogis","dnorm",
   "dpar","dpois","dunif","dweib","dmulti","dmnorm","dmvnorm","dwish","dinvgamma",
   "dhyper","dnbinom","dt","dchisqr","dexp","dbeta",
-  # link helpers
+  # link/helpers
   "cloglog","logit","probit","ilogit","equals","inprod"
 )
 
-# Combine soft-wrapped lines using a last-character heuristic
+# Merge wrapped lines using a heuristic
 .coalesce_lines <- function(model_lines) {
   out <- character(0); buf <- ""
   for (ln in model_lines) {
@@ -84,8 +84,7 @@ suppressWarnings(suppressMessages({
     m <- regexec("for\\s*\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s+in\\s+([^\\)]*)\\)", ln, perl = TRUE)
     hit <- regmatches(ln, m)[[1]]
     if (length(hit) >= 3) {
-      v <- trimws(hit[2])
-      r <- trimws(hit[3])
+      v <- trimws(hit[2]); r <- trimws(hit[3])
       vars   <- c(vars, v)
       ranges <- c(ranges, r)
       labels <- c(labels, paste0(v, " in ", r))
@@ -93,7 +92,6 @@ suppressWarnings(suppressMessages({
   }
   if (!length(vars))
     return(data.frame(var=character(), range=character(), label=character(), stringsAsFactors=FALSE))
-  
   data.frame(var=vars, range=ranges, label=labels, stringsAsFactors=FALSE)
 }
 
@@ -156,19 +154,13 @@ suppressWarnings(suppressMessages({
          ifelse(node_names %in% det_set, "deterministic", "data/derived"))
 }
 
-# ---------- Builder ----------
-build_bugs_dependency_graph <- function(model_text,
-                                        plot_static = FALSE,
-                                        show_plates = TRUE,
-                                        vertex_size = 26,
-                                        edge_arrow_size = 0.4,
-                                        plate_padding = 0.35) {
-  # prepare lines safely (avoid 'lines' name!)
+# ---------- Core: build tables ----------
+build_bugs_tables <- function(model_text, collapse_lists = TRUE, drop_index_brackets_in_label = TRUE) {
   raw <- unlist(strsplit(model_text, "\n", fixed=TRUE))
   raw <- .strip_comments(raw)
   model_lines <- .extract_model_block(raw)
   
-  loop_df <- .extract_loops(model_lines)                 # var, range, label
+  loop_df <- .extract_loops(model_lines)
   edges   <- .extract_edges_from_lines(model_lines)
   
   # Drop edges from loop index vars (e.g., i, t, tmt)
@@ -177,19 +169,20 @@ build_bugs_dependency_graph <- function(model_text,
     edges <- edges[!(edges$from %in% loop_vars), , drop = FALSE]
   }
   
-  if (!nrow(edges)) {
-    warning("No dependencies found. Check '~' and '<-'.")
-    g <- make_empty_graph()
-    return(list(nodes = data.frame(name=character()),
-                edges=edges, graph=g, plates=loop_df))
+  nodes <- sort(unique(c(edges$from, edges$to)))
+  if (!length(nodes)) {
+    return(list(
+      nodes = data.frame(name=character(), label=character(), type=character(),
+                         index_vars=I(list()), parents=I(list()), children=I(list()),
+                         n_parents=integer(), n_children=integer(), plates=I(list()),
+                         stringsAsFactors=FALSE),
+      edges = data.frame(from=character(), to=character(), stringsAsFactors=FALSE)
+    ))
   }
   
-  nodes <- sort(unique(c(edges$from, edges$to)))
-  
-  # Build index membership map
+  # Index membership map from tokens
   tokens <- .tokenize_symbols(paste(model_lines, collapse=" "))
   tokens <- unique(tokens[!tokens %in% .ignore_set])
-  
   index_map <- setNames(replicate(length(nodes), character(0), simplify = FALSE), nodes)
   for (t in tokens) {
     base <- .normalize_index(t)
@@ -199,255 +192,127 @@ build_bugs_dependency_graph <- function(model_text,
     }
   }
   
-  vertices <- data.frame(name = nodes, stringsAsFactors = FALSE)
-  vertices$index_vars <- I(index_map[vertices$name])
-  vertices$type <- .classify_nodes(model_lines, vertices$name)
+  # Node types
+  node_types <- .classify_nodes(model_lines, nodes)
   
-  g <- graph_from_data_frame(edges, directed = TRUE, vertices = vertices)
+  # Parents & children maps
+  parents_map  <- tapply(edges$from, edges$to, function(x) sort(unique(x)))
+  children_map <- tapply(edges$to,   edges$from, function(x) sort(unique(x)))
   
-  if (plot_static) {
-    set.seed(42)
-    lay <- layout_with_sugiyama(g)$layout
-    plot(g,
-         layout = lay,
-         vertex.label = V(g)$name,
-         vertex.size = vertex_size,
-         vertex.label.cex = 0.8,
-         vertex.label.family = "sans",
-         vertex.color = "lightgray",
-         edge.arrow.size = edge_arrow_size,
-         edge.curved = 0.05)
-    title("BUGS/JAGS Dependency Graph (static with plate rectangles)")
-    
-    if (show_plates && nrow(loop_df)) {
-      xy <- lay; rownames(xy) <- V(g)$name
-      cols <- c("#8ecae6","#90be6d","#f4a261","#e9c46a","#bdb2ff")
-      for (k in seq_len(nrow(loop_df))) {
-        loop_var <- loop_df$var[k]
-        members <- V(g)$name[vapply(V(g)$name, function(vn){
-          iv <- index_map[[vn]]; length(iv) && loop_var %in% iv
-        }, logical(1))]
-        if (length(members)) {
-          x <- xy[members,1]; y <- xy[members,2]
-          rect(min(x)-plate_padding, min(y)-plate_padding,
-               max(x)+plate_padding, max(y)+plate_padding,
-               border = cols[(k-1) %% length(cols) + 1], lwd = 2)
-          text(min(x)-plate_padding, max(y)+plate_padding,
-               labels = loop_df$label[k], adj = c(0,0), cex = 0.9)
-        }
+  # Plate membership per node (labels only; no separate table)
+  # Compose human-friendly plate labels like "i in 1:4"
+  plate_lookup <- if (nrow(loop_df)) setNames(as.list(loop_df$label), loop_df$var) else list()
+  
+  plate_membership <- lapply(nodes, function(vn){
+    labs <- character(0)
+    if (length(index_map[[vn]])) {
+      for (iv in index_map[[vn]]) {
+        if (!is.null(plate_lookup[[iv]])) labs <- c(labs, plate_lookup[[iv]])
       }
     }
-  }
+    unique(labs)
+  })
   
-  list(nodes = vertices, edges = edges, graph = g, plates = loop_df)
-}
-
-# ---------- Interactive (visNetwork) ----------
-to_vis <- function(res, raw_model_lines) {
-  nodes <- res$nodes; edges <- res$edges
-  
-  plate_tip <- vapply(nodes$index_vars, function(iv){
-    if (!length(iv)) "" else paste0("indexed by: ", paste(iv, collapse=", "))
-  }, character(1))
-  
-  nodes$id <- seq_len(nrow(nodes))
-  name_to_id <- setNames(nodes$id, nodes$name)
-  
-  type_cols <- c(stochastic="#FFD063", deterministic="#A6D6FF", `data/derived`="#DADADA")
-  nodes$color.background <- unname(type_cols[nodes$type])
-  nodes$color.border <- "#555555"
-  nodes$color.highlight.background <- "#FFEEA6"
-  nodes$color.highlight.border <- "#333333"
-  nodes$label <- nodes$name
-  nodes$title <- paste0(
-    "<b>", nodes$name, "</b><br/>",
-    "type: ", nodes$type,
-    ifelse(nchar(plate_tip)>0, paste0("<br/>", plate_tip), "")
-  )
-  
-  edf <- data.frame(
-    from = name_to_id[edges$from],
-    to   = name_to_id[edges$to],
-    arrows = "to",
-    smooth = TRUE,
+  # Nodes table
+  nodes_tbl <- data.frame(
+    name  = nodes,                                   # normalized name with []
+    label = if (drop_index_brackets_in_label) .strip_all_brackets(nodes) else nodes,
+    type  = node_types,
     stringsAsFactors = FALSE
   )
+  nodes_tbl$index_vars <- I(index_map[nodes_tbl$name])
+  nodes_tbl$parents    <- I(lapply(nodes_tbl$name, function(nm) if (!is.null(parents_map[[nm]])) parents_map[[nm]] else character(0)))
+  nodes_tbl$children   <- I(lapply(nodes_tbl$name, function(nm) if (!is.null(children_map[[nm]])) children_map[[nm]] else character(0)))
+  nodes_tbl$n_parents  <- vapply(nodes_tbl$parents, length, integer(1))
+  nodes_tbl$n_children <- vapply(nodes_tbl$children, length, integer(1))
+  nodes_tbl$plates     <- I(plate_membership)
   
-  list(nodes = nodes, edges = edf)
-}
-
-plot_interactive <- function(res, model_text, title = "JAGS Dependency Graph (interactive)") {
-  raw_lines <- {
-    x <- unlist(strsplit(model_text, "\n", fixed=TRUE))
-    x <- gsub("#.*$","", x)
-    x[nzchar(trimws(x))]
-  }
-  ve <- to_vis(res, raw_lines)
-  
-  nodes_df <- ve$nodes[, c("id","label","title","color.background","color.border",
-                           "color.highlight.background","color.highlight.border")]
-  edges_df <- ve$edges
-  
-  g <- visNetwork::visNetwork(nodes_df, edges_df, width="100%", height="650px")
-  g <- visNetwork::visOptions(g, highlightNearest=TRUE, nodesIdSelection=TRUE)
-  g <- visNetwork::visPhysics(g, stabilization=TRUE, solver="forceAtlas2Based")
-  g <- visNetwork::visEdges(g, arrows="to")
-  g <- visNetwork::visNodes(g, shape="box", borderWidth=1)
-  g <- visNetwork::visLegend(
-    g,
-    addNodes = data.frame(
-      label=c("stochastic","deterministic","data/derived"),
-      shape="box",
-      color=c("#FFD063","#A6D6FF","#DADADA")
-    ),
-    useGroups = FALSE, width=0.25
-  )
-  g <- visNetwork::visInteraction(g, navigationButtons=TRUE, dragNodes=TRUE, zoomView=TRUE)
-  g <- visNetwork::visLayout(g, randomSeed=42)
-  g <- visNetwork::visExport(g, type="png")
-  
-  # Title added once, no duplication
-  g <- htmlwidgets::prependContent(
-    g,
-    htmltools::tags$h3(style="margin:6px 0 10px; font-family:sans-serif;", title)
-  )
-  g
-}
-
-# Literal rectangle plates on the canvas
-plot_interactive_with_plates <- function(res, model_text,
-                                         title = "JAGS Dependency Graph (interactive plates)",
-                                         plate_colors = c("#8ecae6","#90be6d","#f4a261","#e9c46a","#bdb2ff"),
-                                         plate_padding_px = 24) {
-  
-  raw_lines <- {
-    x <- unlist(strsplit(model_text, "\n", fixed=TRUE))
-    x <- gsub("#.*$","", x)
-    x[nzchar(trimws(x))]
-  }
-  ve <- to_vis(res, raw_lines)
-  
-  nodes_df <- ve$nodes[, c("id","label","title","color.background","color.border",
-                           "color.highlight.background","color.highlight.border")]
-  edges_df <- ve$edges
-  
-  # group nodes by loop var membership
-  plate_groups <- list()
-  if (nrow(res$plates)) {
-    for (k in seq_len(nrow(res$plates))) {
-      loop_var <- res$plates$var[k]
-      label    <- res$plates$label[k]
-      member_ids <- ve$nodes$id[
-        vapply(res$nodes$index_vars, function(iv) loop_var %in% iv, logical(1))
-      ]
-      plate_groups[[label]] <- unname(member_ids)
-    }
+  if (isTRUE(collapse_lists)) {
+    collapse <- function(x) if (length(x)) paste(x, collapse = ",") else ""
+    nodes_tbl$index_vars_chr <- vapply(nodes_tbl$index_vars, collapse, character(1))
+    nodes_tbl$parents_chr    <- vapply(nodes_tbl$parents,    collapse, character(1))
+    nodes_tbl$children_chr   <- vapply(nodes_tbl$children,   collapse, character(1))
+    nodes_tbl$plates_chr     <- vapply(nodes_tbl$plates,     collapse, character(1))
   }
   
-  g <- visNetwork(nodes_df, edges_df, width="100%", height="650px")
-  g <- visOptions(g, highlightNearest=TRUE, nodesIdSelection=TRUE)
-  g <- visPhysics(g, stabilization=TRUE, solver="forceAtlas2Based")
-  g <- visEdges(g, arrows="to")
-  g <- visNodes(g, shape="box", borderWidth=1)
-  g <- visLegend(
-    g,
-    addNodes = data.frame(
-      label=c("stochastic","deterministic","data/derived"),
-      shape="box",
-      color=c("#FFD063","#A6D6FF","#DADADA")
-    ),
-    useGroups = FALSE, width=0.25
+  list(
+    nodes  = nodes_tbl,
+    edges  = unique(data.frame(from = edges$from, to = edges$to, stringsAsFactors = FALSE))
   )
-  g <- visInteraction(g, navigationButtons=TRUE, dragNodes=TRUE, zoomView=TRUE)
-  g <- visLayout(g, randomSeed=42)
-  g <- visExport(g, type="png")
-  
-  # Title once
-  g <- htmlwidgets::prependContent(
-    g,
-    htmltools::tags$h3(style="margin:6px 0 10px; font-family:sans-serif;", title)
-  )
-  
-  # draw plate rectangles post-render
-  plate_groups_json <- jsonlite::toJSON(plate_groups, auto_unbox = TRUE)
-  plate_colors_json <- jsonlite::toJSON(plate_colors, auto_unbox = TRUE)
-  js_code <- sprintf("
-    function(ctx) {
-      var groups = %s;
-      var colors = %s;
-      var pad = %d;
-      var net = this;
-
-      function bboxForIds(ids) {
-        if (!ids || !ids.length) return null;
-        var pos = net.getPositions(ids);
-        var xs = [], ys = [];
-        ids.forEach(function(id){
-          var p = pos[id]; if (!p) return;
-          xs.push(p.x); ys.push(p.y);
-        });
-        if (!xs.length) return null;
-        var xmin = Math.min.apply(null, xs) - pad,
-            xmax = Math.max.apply(null, xs) + pad,
-            ymin = Math.min.apply(null, ys) - pad,
-            ymax = Math.max.apply(null, ys) + pad;
-        return {xmin:xmin, xmax:xmax, ymin:ymin, ymax:ymax};
-      }
-
-      var labels = Object.keys(groups);
-      for (var gi = 0; gi < labels.length; gi++) {
-        var label = labels[gi];
-        var ids   = groups[label];
-        if (!ids || !ids.length) continue;
-        var bb = bboxForIds(ids);
-        if (!bb) continue;
-
-        var tl = net.canvasToDOM({x: bb.xmin, y: bb.ymin});
-        var br = net.canvasToDOM({x: bb.xmax, y: bb.ymax});
-        var x = tl.x, y = tl.y, w = br.x - tl.x, h = br.y - tl.y;
-
-        ctx.save();
-        ctx.setTransform(1,0,0,1,0,0);
-
-        var col = colors[gi %% colors.length];
-        ctx.globalAlpha = 0.08;
-        ctx.fillStyle = col;
-        ctx.fillRect(x, y, w, h);
-
-        ctx.globalAlpha = 1.0;
-        ctx.strokeStyle = col;
-        ctx.lineWidth = 2;
-        ctx.strokeRect(x, y, w, h);
-
-        ctx.font = '12px sans-serif';
-        ctx.fillStyle = '#333';
-        ctx.fillText(label, x + 6, y + 14);
-
-        ctx.restore();
-      }
-    }", plate_groups_json, plate_colors_json, as.integer(plate_padding_px))
-  
-  g <- visEvents(g, afterDrawing = htmlwidgets::JS(js_code))
-  g
 }
 
-# ---------- Example JAGS model ----------
-model_txt <- "
-# Model
+# ---------- Export (nodes & edges ONLY) ----------
+export_tables_csv <- function(NodesandEdgesTable, out_prefix = "bugs_graph") {
+  dir_to_make <- dirname(out_prefix)
+  if (!dir.exists(dir_to_make)) dir.create(dir_to_make, recursive = TRUE, showWarnings = FALSE)
+  
+  nodes_csv <- paste0(out_prefix, "_nodes.csv")
+  edges_csv <- paste0(out_prefix, "_edges.csv")
+  
+  nodes_df <- NodesandEdgesTable$nodes
+  if (!all(c("index_vars_chr","parents_chr","children_chr","plates_chr") %in% names(nodes_df))) {
+    to_chr <- function(x) vapply(x, function(v) paste(v, collapse=","), character(1))
+    nodes_df$index_vars_chr <- to_chr(nodes_df$index_vars)
+    nodes_df$parents_chr    <- to_chr(nodes_df$parents)
+    nodes_df$children_chr   <- to_chr(nodes_df$children)
+    nodes_df$plates_chr     <- to_chr(nodes_df$plates)
+  }
+  
+  write.csv(
+    nodes_df[, c("name","label","type","index_vars_chr","parents_chr","children_chr",
+                 "n_parents","n_children","plates_chr")],
+    file = nodes_csv, row.names = FALSE
+  )
+  write.csv(NodesandEdgesTable$edges, file = edges_csv, row.names = FALSE)
+  
+  message("Wrote:\n  ", nodes_csv, "\n  ", edges_csv)
+  invisible(list(nodes_csv = nodes_csv, edges_csv = edges_csv))
+}
+
+# ---------- Robust input ----------
+safe_read_model_text <- function(arg) {
+  if (identical(arg, "-")) {
+    con <- file("stdin", "r")
+    on.exit(try(close(con), silent = TRUE))
+    txt <- readLines(con, warn = FALSE, encoding = "UTF-8")
+    txt <- paste(txt, collapse = "\n")
+    if (!grepl("\\bmodel\\s*\\{", txt)) stop("STDIN did not contain a 'model { ... }' block.")
+    return(txt)
+  }
+  if (file.exists(arg)) {
+    p <- normalizePath(arg, winslash = "/", mustWork = TRUE)
+    txt <- readLines(p, warn = FALSE, encoding = "UTF-8")
+    txt <- paste(txt, collapse = "\n")
+    if (!grepl("\\bmodel\\s*\\{", txt)) stop("File exists but has no 'model { ... }' block: ", p)
+    return(txt)
+  }
+  if (!grepl("\\bmodel\\s*\\{", arg)) {
+    stop("Input '", arg, "' is neither an existing file nor a literal BUGS/JAGS model string containing 'model{'.")
+  }
+  arg
+}
+
+# ---------- Public API ----------
+bugs_to_nodes_and_edges <- function(model_text, export_csv = FALSE, out_prefix = "bugs_graph") {
+  NodesandEdgesTable <- build_bugs_tables(model_text, collapse_lists = TRUE, drop_index_brackets_in_label = TRUE)
+  if (export_csv) export_tables_csv(NodesandEdgesTable, out_prefix = out_prefix)
+  NodesandEdgesTable
+}
+
+# ---------- Example model (for quick test) ----------
+.example_model <- "
 model{
-  # Data analysis
-  for (tmt in 1:2){                                      # Treatments tmt=1 (Seretide), tmt=2 (Fluticasone)
-    for (i in 1:4){                                      # There are 4 non-absorbing health states
-      r[tmt,i,1:5] ~ dmulti(pi[tmt,i,1:5], n[tmt,i])    # Multinomial DATA
-      pi[tmt,i,1:5] ~ ddirch(prior[tmt,i,1:5])          # Dirichlet prior for probs.
+  for (tmt in 1:2){
+    for (i in 1:4){
+      r[tmt,i,1:5] ~ dmulti(pi[tmt,i,1:5], n[tmt,i])
+      pi[tmt,i,1:5] ~ ddirch(prior[tmt,i,1:5])
     }
   }
-  # Calculating summaries from a decision model
-  for (tmt in 1:2){ 
-    for (i in 1:5){ s[tmt,i,1] <- equals(i,1) }         # Initialise starting state
-    for (i in 1:4){  
+  for (tmt in 1:2){
+    for (i in 1:5){ s[tmt,i,1] <- equals(i,1) }
+    for (i in 1:4){
       for (t in 2:13){
-        s[tmt,i,t] <- inprod(s[tmt,1:4,t-1], pi[tmt,1:4,i])  # 12 cycles
+        s[tmt,i,t] <- inprod(s[tmt,1:4,t-1], pi[tmt,1:4,i])
       }
       E[tmt,i] <- sum(s[tmt,i,2:13])
     }
@@ -460,17 +325,34 @@ model{
 }
 "
 
-# ---------- Run ----------
-res <- build_bugs_dependency_graph(model_txt, plot_static = TRUE, show_plates = TRUE)
+# ---------- Demo when sourced directly ----------
+if (sys.nframe() == 0L) {
+  message("Demo: parsing built-in model to NodesandEdgesTable (nodes & edges only)…")
+  NodesandEdgesTable <- bugs_to_nodes_and_edges(.example_model, export_csv = TRUE, out_prefix = "out/example_bugs_graph")
+  message("Nodes (first 8):")
+  print(head(NodesandEdgesTable$nodes[, c("label","type","index_vars_chr","n_parents","n_children","plates_chr")], 8))
+  message("Edges (first 8):")
+  print(head(NodesandEdgesTable$edges, 8))
+}
 
-# Interactive
-plot_interactive(res, model_text = model_txt, title = "Markov Decision Model (Dirichlet–Multinomial)")
+# ---------- CLI ----------
+# Usage:
+#   Rscript bugs_tables_nodesandedges.R <model_path | '-' | 'literal model text'> [out_prefix]
+# Examples:
+#   Rscript bugs_tables_nodesandedges.R path/to/model.bug out/my_graph
+#   cat path/to/model.bug | Rscript bugs_tables_nodesandedges.R - out/my_graph
+#   Rscript bugs_tables_nodesandedges.R "model{ x ~ dnorm(0,1) }" my_graph
+if (!interactive()) {
+  args <- commandArgs(trailingOnly = TRUE)
+  if (length(args) >= 1) {
+    input_arg  <- args[1]
+    out_prefix <- if (length(args) >= 2) args[2] else file_path_sans_ext(basename(input_arg))
+    out_dir <- dirname(out_prefix); if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+    model_text <- tryCatch(safe_read_model_text(input_arg), error = function(e) {
+      cat("\nI/O diagnostic — getwd(): ", getwd(), "\nFiles here:\n", paste(list.files("."), collapse = "\n"), "\n\n", sep = "")
+      stop(e)
+    })
+    invisible(bugs_to_nodes_and_edges(model_text, export_csv = TRUE, out_prefix = out_prefix))
+  }
+}
 
-# Interactive with plate rectangles
-plot_interactive_with_plates(
-  res,
-  model_text = model_txt,
-  title = "Markov Decision Model (Dirichlet–Multinomial)",
-  plate_colors = c("#8ecae6","#90be6d","#f4a261"),
-  plate_padding_px = 28
-)
