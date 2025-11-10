@@ -1,0 +1,406 @@
+# ================================================================
+# 1) Self-contained BUGS/JAGS parser (helpers inside)
+# ================================================================
+parse_bugs_to_nodes_edges <- function(input, is_file = FALSE) {
+  read_input <- function(x, is_file) {
+    if (isTRUE(is_file)) {
+      if (!file.exists(x)) stop(sprintf("File not found: %s", x), call. = FALSE)
+      readLines(x, warn = FALSE, encoding = "UTF-8")
+    } else if (length(x) == 1L) unlist(strsplit(x, "\n", fixed = TRUE)) else x
+  }
+  strip_comments <- function(lines) {
+    lines <- gsub("#.*$", "", lines)
+    lines <- gsub("\r", "", lines, fixed = TRUE)
+    trimws(lines[nzchar(trimws(lines))])
+  }
+  extract_model_block <- function(lines) {
+    txt <- paste(lines, collapse = "\n")
+    mstart <- regexpr("\\bmodel\\s*\\{", txt, perl = TRUE)
+    if (mstart[1] == -1) stop("No 'model { ... }' block found.", call. = FALSE)
+    start <- as.integer(mstart) + attr(mstart, "match.length")
+    depth <- 1L; i <- start; end_pos <- NA_integer_
+    while (i <= nchar(txt)) {
+      ch <- substr(txt, i, i)
+      if (ch == "{") depth <- depth + 1L
+      if (ch == "}") { depth <- depth - 1L; if (depth == 0L) { end_pos <- i - 1L; break } }
+      i <- i + 1L
+    }
+    if (is.na(end_pos)) stop("Unbalanced braces in model block.", call. = FALSE)
+    substr(txt, start, end_pos)
+  }
+  is_numtok <- function(x) grepl("^[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?$", x)
+  tok_vars <- function(expr) {
+    expr <- gsub("\"[^\"]*\"", "", expr)
+    m <- gregexpr("([A-Za-z][A-Za-z0-9_\\.]*\\[[^\\]]+\\])|([A-Za-z][A-Za-z0-9_\\.]*)", expr, perl = TRUE)
+    if (m[[1]][1] == -1) return(character())
+    unique(regmatches(expr, m)[[1]])
+  }
+  id_of <- function(label) {
+    lab <- gsub("\\s+", "", label)
+    lab <- gsub("\\[\\s*([^\\]]+?)\\s*\\]", "_\\1", lab, perl = TRUE)  # [i,j] -> _i,j
+    lab <- gsub(",", "", lab, perl = TRUE)                             # _i,j -> _ij
+    gsub("\\.", "_", lab, perl = TRUE)                                  # tau.c -> tau_c
+  }
+  classify_nodes <- function(statements, labels) {
+    lhs_tilde <- character(); lhs_arrow <- character()
+    for (s in statements) {
+      if (grepl("~", s)) {
+        lhs <- trimws(strsplit(s, "~")[[1]][1])
+        ltok <- tok_vars(lhs); if (length(ltok)) lhs_tilde <- c(lhs_tilde, ltok[1])
+      } else if (grepl("<-", s)) {
+        lhs <- trimws(strsplit(s, "<-")[[1]][1])
+        ltok <- tok_vars(lhs); if (length(ltok)) lhs_arrow <- c(lhs_arrow, ltok[1])
+      }
+    }
+    lhs_tilde <- unique(lhs_tilde); lhs_arrow <- unique(lhs_arrow)
+    vapply(labels, function(v) {
+      if (v %in% lhs_tilde) "stochastic"
+      else if (v %in% lhs_arrow) "deterministic"
+      else "data"
+    }, character(1))
+  }
+  dist_for <- function(label, statements) {
+    for (s in statements) {
+      if (!grepl("~", s)) next
+      parts <- strsplit(s, "~")[[1]]
+      lhs <- trimws(parts[1]); rhs <- trimws(parts[2])
+      ltok <- tok_vars(lhs)
+      if (length(ltok) && ltok[1] == label) {
+        m <- regexpr("\\b([A-Za-z][A-Za-z0-9_\\.]*)\\s*\\(", rhs, perl = TRUE)
+        if (m[1] != -1) return(sub("\\($", "", regmatches(rhs, m)))
+      }
+    }
+    NA_character_
+  }
+  detect_loops <- function(model_txt) {
+    ms <- gregexpr("for\\s*\\(\\s*([A-Za-z][A-Za-z0-9_\\.]*)\\s+in\\s+([^\\)]*)\\)", model_txt, perl = TRUE)
+    if (ms[[1]][1] == -1) return(list())
+    spans <- regmatches(model_txt, ms)[[1]]
+    out <- list()
+    for (seg in spans) {
+      it  <- sub("^for\\s*\\(\\s*([A-Za-z][A-Za-z0-9_\\.]*)\\s+in\\s+([^\\)]*)\\)$", "\\1", seg, perl = TRUE)
+      rng <- sub("^for\\s*\\(\\s*([A-Za-z][A-Za-z0-9_\\.]*)\\s+in\\s+([^\\)]*)\\)$", "\\2", seg, perl = TRUE)
+      bounds <- tok_vars(rng)
+      out[[length(out)+1L]] <- list(iterator=it, bounds=bounds)
+    }
+    out
+  }
+  edges_from_statements <- function(statements, type_lookup, parent_blacklist_ids, iterators) {
+    ef <- et <- character()
+    for (s in statements) {
+      if (!grepl("~|<-", s)) next
+      op <- if (grepl("~", s)) "~" else "<-"
+      parts <- strsplit(s, op)[[1]]
+      lhs <- trimws(parts[1]); rhs <- paste(parts[-1], collapse = op)
+      lhs_tok <- tok_vars(lhs); rhs_tok <- tok_vars(rhs)
+      if (!length(lhs_tok)) next
+      target <- lhs_tok[1]; target_id <- id_of(target)
+      parents <- rhs_tok[rhs_tok != target]
+      parents <- parents[!is_numtok(parents)]
+      parent_ids <- vapply(parents, id_of, "")
+      drop_ids <- unique(c(parent_blacklist_ids, iterators, paste0("plate_", iterators)))
+      keep <- !(parent_ids %in% drop_ids)
+      if (any(keep)) { ef <- c(ef, parent_ids[keep]); et <- c(et, rep(target_id, sum(keep))) }
+    }
+    if (!length(ef)) data.frame(from=character(),to=character(),kind=character(),stringsAsFactors=FALSE)
+    else data.frame(from=ef,to=et,kind=unname(type_lookup[et]),stringsAsFactors=FALSE)
+  }
+  
+  # -------- pipeline --------
+  raw <- read_input(input, is_file)
+  lines <- strip_comments(raw)
+  model_txt <- extract_model_block(lines)
+  statements <- trimws(unlist(strsplit(model_txt, "[;\n]"))); statements <- statements[nzchar(statements)]
+  
+  loops <- detect_loops(model_txt)
+  iterators <- unique(vapply(loops, function(x)x$iterator,""))
+  loop_bounds <- unique(unlist(lapply(loops, function(x)x$bounds)))
+  
+  all_tokens <- unique(unlist(lapply(statements, tok_vars)))
+  reserved <- c("for","in","if","else","while","model","step","pow","log","sqrt","exp","abs","E","e")
+  fn_calls <- unique(unlist(lapply(statements,function(s){
+    m<-gregexpr("\\b([A-Za-z][A-Za-z0-9_\\.]*)\\s*\\(",s,perl=TRUE)
+    if(m[[1]][1]==-1)character()else sub("\\($","",regmatches(s,m)[[1]])
+  })))
+  base_syms <- setdiff(all_tokens, unique(c(fn_calls,reserved)))
+  base_syms <- base_syms[!is_numtok(base_syms)]
+  base_syms <- unique(c(base_syms, loop_bounds))
+  
+  types <- classify_nodes(statements, base_syms)
+  plates_vec <- vapply(base_syms, function(x) {
+    m <- regexec("^([A-Za-z][A-Za-z0-9_\\.]*)\\[([^\\]]+)\\]$", x, perl = TRUE)
+    mm <- regmatches(x, m)[[1]]
+    if (length(mm) != 3) return(NA_character_)
+    idx <- strsplit(mm[3], ",", fixed = TRUE)[[1]]
+    idx <- trimws(idx); idx <- gsub("^.*?:", "", idx); idx <- gsub("[^A-Za-z0-9_\\.]", "", idx)
+    idx <- idx[!is_numtok(idx) & nzchar(idx)]
+    if (length(idx)) paste(idx, collapse = ",") else NA_character_
+  }, character(1))
+  dists <- vapply(base_syms, function(x) if (identical(types[[x]], "stochastic")) dist_for(x, statements) else NA_character_, "")
+  ids <- vapply(base_syms, id_of, "")
+  
+  nodes_var <- data.frame(id=ids,label=base_syms,type=unname(types),
+                          dist=dists,plates=plates_vec,stringsAsFactors=FALSE)
+  nodes_index <- if(length(iterators))
+    data.frame(id=iterators,label=iterators,type="index",dist=NA,plates=NA,stringsAsFactors=FALSE)
+  else data.frame()
+  nodes_plate <- if(length(iterators))
+    data.frame(id=paste0("plate_",iterators),label=paste(iterators,"plate"),
+               type="plate",dist=NA,plates=NA,stringsAsFactors=FALSE)
+  else data.frame()
+  
+  nodes_all <- rbind(nodes_index, nodes_plate, nodes_var)
+  rows_keep <- !duplicated(nodes_all$id)
+  nodes_all <- nodes_all[rows_keep, , FALSE]
+  
+  type_lookup <- setNames(nodes_all$type, nodes_all$id)
+  parent_blacklist_ids <- vapply(unique(c(fn_calls,reserved)), id_of, "")
+  edges <- edges_from_statements(statements, type_lookup, parent_blacklist_ids, iterators)
+  if(nrow(edges)) edges <- edges[order(edges$to,edges$from), , FALSE]
+  
+  list(nodes = nodes_all, edges = edges)
+}
+
+# ================================================================
+# 2) Auto-tester: derives expectations from the BUGS/JAGS code
+#    Prints ✅/❌ diagnostics and shows nodes/edges tables
+# ================================================================
+auto_test_bugs <- function(input, is_file = FALSE, strict_edges = FALSE, max_show = 12) {
+  cat("\n======= auto_test_bugs() =======\n")
+  
+  # parse once
+  res <- parse_bugs_to_nodes_edges(input, is_file = is_file)
+  nodes <- res$nodes; edges <- res$edges
+  
+  # helpers for expectation derivation
+  get_model_only <- function(txt) {
+    mstart <- regexpr("\\bmodel\\s*\\{", txt, perl = TRUE)
+    if (mstart[1] == -1) return("")
+    start <- as.integer(mstart) + attr(mstart, "match.length")
+    depth <- 1L; i <- start; end_pos <- NA_integer_
+    while (i <= nchar(txt)) {
+      ch <- substr(txt, i, i)
+      if (ch == "{") depth <- depth + 1L
+      if (ch == "}") { depth <- depth - 1L; if (depth == 0L) { end_pos <- i - 1L; break } }
+      i <- i + 1L
+    }
+    if (is.na(end_pos)) return("")
+    substr(txt, start, end_pos)
+  }
+  tok_vars <- function(expr) {
+    expr <- gsub("\"[^\"]*\"", "", expr)
+    m <- gregexpr("([A-Za-z][A-Za-z0-9_\\.]*\\[[^\\]]+\\])|([A-Za-z][A-Za-z0-9_\\.]*)", expr, perl = TRUE)
+    if (m[[1]][1] == -1) return(character())
+    unique(regmatches(expr, m)[[1]])
+  }
+  id_of <- function(label) {
+    lab <- gsub("\\s+", "", label)
+    lab <- gsub("\\[\\s*([^\\]]+?)\\s*\\]", "_\\1", lab, perl = TRUE)
+    lab <- gsub(",", "", lab, perl = TRUE)
+    gsub("\\.", "_", lab, perl = TRUE)
+  }
+  is_numtok <- function(x) grepl("^[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?$", x)
+  
+  # read full source text
+  src <- if (isTRUE(is_file)) paste(readLines(input, warn = FALSE, encoding = "UTF-8"), collapse = "\n") else input
+  src <- gsub("#.*$", "", src); src <- gsub("\r", "", src)
+  
+  model_txt <- get_model_only(src)
+  statements <- { s <- unlist(strsplit(model_txt, "[;\n]", perl = TRUE)); s <- trimws(s); s[nzchar(s)] }
+  
+  # detect loops again (for expectations)
+  detect_loops <- function(model_txt) {
+    ms <- gregexpr("for\\s*\\(\\s*([A-Za-z][A-Za-z0-9_\\.]*)\\s+in\\s+([^\\)]*)\\)", model_txt, perl = TRUE)
+    if (ms[[1]][1] == -1) return(list())
+    spans <- regmatches(model_txt, ms)[[1]]
+    out <- vector("list", length(spans))
+    for (k in seq_along(spans)) {
+      seg <- spans[k]
+      it  <- sub("^for\\s*\\(\\s*([A-Za-z][A-Za-z0-9_\\.]*)\\s+in\\s+([^\\)]*)\\)$", "\\1", seg, perl = TRUE)
+      rng <- sub("^for\\s*\\(\\s*([A-Za-z][A-Za-z0-9_\\.]*)\\s+in\\s+([^\\)]*)\\)$", "\\2", seg, perl = TRUE)
+      bounds <- tok_vars(rng)
+      out[[k]] <- list(iterator = it, bounds = bounds)
+    }
+    out
+  }
+  loops <- detect_loops(model_txt)
+  iterators   <- unique(vapply(loops, function(x) x$iterator, ""))
+  loop_bounds <- unique(unlist(lapply(loops, function(x) x$bounds)))
+  
+  # derive expected nodes & edges from code
+  expected_nodes <- list()
+  expected_edges <- list()
+  reserved <- c("for","in","if","else","while","model","step","pow","log","sqrt","exp","abs","E","e")
+  
+  for (s in statements) {
+    if (!grepl("~|<-", s)) next
+    op <- if (grepl("~", s)) "~" else "<-"
+    parts <- strsplit(s, op, perl = TRUE)[[1]]
+    if (length(parts) < 2) next
+    lhs <- trimws(parts[1]); rhs <- paste(parts[-1], collapse = op)
+    
+    lhs_tok <- tok_vars(lhs); rhs_tok <- tok_vars(rhs)
+    if (!length(lhs_tok)) next
+    target_label <- lhs_tok[1]; target_id <- id_of(target_label)
+    target_type <- if (op == "~") "stochastic" else "deterministic"
+    expected_nodes[[target_id]] <- list(type = target_type)
+    
+    # parents
+    mfun <- gregexpr("\\b([A-Za-z][A-Za-z0-9_\\.]*)\\s*\\(", rhs, perl = TRUE)
+    fn_calls <- if (mfun[[1]][1] == -1) character() else sub("\\($", "", regmatches(rhs, mfun)[[1]])
+    parents <- rhs_tok[rhs_tok != target_label]
+    parents <- parents[!is_numtok(parents)]
+    parents <- parents[!(parents %in% c(fn_calls, reserved))]
+    parent_ids <- vapply(parents, id_of, "")
+    parent_ids <- parent_ids[!(parent_ids %in% c(iterators, paste0("plate_", iterators)))]
+    if (length(parent_ids)) {
+      for (pid in parent_ids) {
+        expected_edges[[length(expected_edges)+1L]] <- c(from = pid, to = target_id, kind = target_type)
+      }
+    }
+  }
+  # add iterators (index) and plate expectations; bounds as data
+  for (it in iterators) expected_nodes[[it]] <- list(type="index")
+  for (it in iterators) expected_nodes[[paste0("plate_", it)]] <- list(type="plate")
+  for (b in loop_bounds) expected_nodes[[id_of(b)]] <- list(type="data")
+  
+  exp_nodes_df <- {
+    ids <- names(expected_nodes)
+    data.frame(id = ids, exp_type = vapply(ids, function(id) expected_nodes[[id]]$type, ""), stringsAsFactors = FALSE)
+  }
+  exp_edges_df <- if (length(expected_edges)) {
+    ee <- do.call(rbind, lapply(expected_edges, function(x) data.frame(t(x), stringsAsFactors = FALSE)))
+    rownames(ee) <- NULL; ee
+  } else data.frame(from=character(), to=character(), kind=character(), stringsAsFactors = FALSE)
+  
+  # ------------- checks (✅/❌) -------------
+  show_some <- function(x) if (length(x) > max_show) c(x[1:max_show], paste0("... (", length(x)-max_show, " more)")) else x
+  ok <- TRUE
+  
+  # structure
+  s_ok <- is.data.frame(nodes) && all(c("id","label","type","dist","plates") %in% names(nodes))
+  e_ok <- is.data.frame(edges) && all(c("from","to","kind") %in% names(edges))
+  cat(if (s_ok) "✅" else "❌", " nodes table structure\n", sep = " "); ok <- ok && s_ok
+  cat(if (e_ok) "✅" else "❌", " edges table structure\n", sep = " "); ok <- ok && e_ok
+  
+  # counts
+  cat(sprintf("ℹ️  counts: %d nodes, %d edges\n", nrow(nodes), nrow(edges)))
+  tc <- sort(table(nodes$type), decreasing = TRUE); if (length(tc)) print(tc)
+  
+  # unique ids
+  dup_ids <- nodes$id[duplicated(nodes$id)]
+  u_ok <- length(dup_ids) == 0L
+  cat(if (u_ok) "✅" else "❌", " unique node IDs\n", sep = " ")
+  if (!u_ok) cat("   duplicates: ", paste(show_some(unique(dup_ids)), collapse = ", "), "\n")
+  ok <- ok && u_ok
+  
+  # node presence + type agreement (derived)
+  missing_nodes <- subset(exp_nodes_df, !(id %in% nodes$id))
+  nm_ok <- nrow(missing_nodes) == 0L
+  cat(if (nm_ok) "✅" else "❌", " required nodes present (derived)\n", sep = " ")
+  if (!nm_ok) cat("   missing: ", paste(show_some(missing_nodes$id), collapse = ", "), "\n")
+  ok <- ok && nm_ok
+  
+  # type mismatches
+  common_ids <- intersect(exp_nodes_df$id, nodes$id)
+  if (length(common_ids)) {
+    comp <- merge(exp_nodes_df, nodes[, c("id","type")], by = "id", all.x = TRUE)
+    mism <- subset(comp, exp_type != type)
+    tm_ok <- nrow(mism) == 0L
+    cat(if (tm_ok) "✅" else "❌", " node types match (derived)\n", sep = " ")
+    if (!tm_ok) {
+      to_show <- head(mism, max_show)
+      cat("   mismatches:\n")
+      apply(to_show, 1, function(r) cat("    - ", r["id"], ": expected ", r["exp_type"], ", got ", r["type"], "\n", sep = ""))
+      if (nrow(mism) > nrow(to_show)) cat("    ... (", nrow(mism)-nrow(to_show), " more)\n", sep = "")
+    }
+    ok <- ok && tm_ok
+  }
+  
+  # edge presence (derived)
+  if (nrow(exp_edges_df)) {
+    edges$kind <- as.character(edges$kind)
+    key <- function(d) paste0(d$from,"->",d$to,"[",d$kind,"]")
+    missing_edges <- exp_edges_df[!(key(exp_edges_df) %in% key(edges)), , drop = FALSE]
+    me_ok <- nrow(missing_edges) == 0L
+    cat(if (me_ok) "✅" else "❌", " required edges present (derived)\n", sep = " ")
+    if (!me_ok) {
+      cat("   missing edges:\n")
+      to_show <- head(missing_edges, max_show)
+      apply(to_show, 1, function(r) cat("    - ", r["from"], " -> ", r["to"], " [", r["kind"], "]\n", sep=""))
+      if (nrow(missing_edges) > nrow(to_show)) cat("    ... (", nrow(missing_edges)-nrow(to_show), " more)\n", sep="")
+    }
+    ok <- ok && me_ok
+    
+    if (isTRUE(strict_edges)) {
+      extra_edges <- edges[!(key(edges) %in% key(exp_edges_df)), , drop = FALSE]
+      se_ok <- nrow(extra_edges) == 0L
+      cat(if (se_ok) "✅" else "❌", " no extra edges beyond derived\n", sep = " ")
+      if (!se_ok) {
+        cat("   extra edges:\n")
+        to_show <- head(extra_edges, max_show)
+        apply(to_show, 1, function(r) cat("    - ", r["from"], " -> ", r["to"], " [", r["kind"], "]\n", sep=""))
+        if (nrow(extra_edges) > nrow(to_show)) cat("    ... (", nrow(extra_edges)-nrow(to_show), " more)\n", sep="")
+      }
+      ok <- ok && se_ok
+    }
+  } else {
+    cat("ℹ️  no derived edges to check\n")
+  }
+  
+  # plate/index coherence
+  idx_ids <- nodes$id[nodes$type == "index"]
+  needed_plates <- paste0("plate_", idx_ids)
+  missing_plates <- setdiff(needed_plates, nodes$id)
+  p_ok <- length(missing_plates) == 0L
+  cat(if (p_ok) "✅" else "❌", " plate nodes exist for each index\n", sep = " ")
+  if (!p_ok) cat("   missing plates: ", paste(show_some(missing_plates), collapse = ", "), "\n")
+  ok <- ok && p_ok
+  
+  # Show tables
+  cat("\n🧩 Nodes:\n"); print(nodes, row.names = FALSE)
+  cat("\n🔗 Edges:\n"); if (nrow(edges)) print(edges, row.names = FALSE) else cat("(no edges)\n")
+  
+  cat("\nSummary: ", if (ok) "✅ All checks passed!" else "❌ Some checks failed.", "\n", sep = "")
+  invisible(list(ok = ok, parsed = res,
+                 expected = list(nodes = exp_nodes_df, edges = exp_edges_df)))
+}
+
+# ================================================================
+# 3) Example usage (replace with your model or file path)
+# ================================================================
+
+# Gamma–Poisson
+BUGS_model_1 <- "model{
+for(i in 1:N){
+  theta[i] ~ dgamma(alpha,beta)
+  lambda[i] <- theta[i]*t[i]
+  x[i] ~ dpois(lambda[i])
+}
+alpha ~ dexp(1)
+beta ~ dgamma(0.1,1.0)
+}"
+auto_test_bugs(BUGS_model_1)
+
+# RATS
+BUGS_model_2 <- "model
+{
+for( i in 1 : N ) {
+  for( j in 1 : T ) {
+    Y[i , j] ~ dnorm(mu[i , j],tau.c)
+    mu[i , j] <- alpha[i] + beta[i] * (x[j] - xbar)
+  }
+  alpha[i] ~ dnorm(alpha.c,tau.alpha)
+  beta[i] ~ dnorm(beta.c,tau.beta)
+}
+tau.c ~ dgamma(0.001,0.001)
+sigma <- 1 / sqrt(tau.c)
+alpha.c ~ dnorm(0.0,1.0E-6)
+sigma.alpha~ dunif(0,100)
+sigma.beta~ dunif(0,100)
+tau.alpha<-1/(sigma.alpha*sigma.alpha)
+tau.beta<-1/(sigma.beta*sigma.beta)
+beta.c ~ dnorm(0.0,1.0E-6)
+alpha0 <- alpha.c - xbar * beta.c
+}"
+auto_test_bugs(BUGS_model_2)
